@@ -1,0 +1,63 @@
+[project]
+name = "kepler-engine"
+version = "0.1.0"
+description = "NASA Kepler KOI exoplanet classification control plane"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.1",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "scikit-learn==1.9.0",
+    "xgboost==3.3.0",
+    "numpy==2.5.1",
+    "scipy==1.18.0",
+    "pandas==2.3.3",
+    "mlflow==3.15.1",
+    "boto3==1.43.63",
+    "celery==5.6.3",
+    "redis==8.1.0",
+    "joblib==1.5.3",
+    "structlog==26.1.0",
+    "prometheus-fastapi-instrumentator==8.1.0",
+    "httpx==0.28.1",
+    "matplotlib>=3.10.0",
+    "cloudpickle>=3.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio>=0.25.0",
+    "httpx==0.28.1",
+    "moto[s3]==5.2.2",
+    "ruff>=0.11.0",
+    "fakeredis>=2.26.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kepler_engine"]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

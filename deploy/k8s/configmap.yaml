@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kepler-engine-config
+  labels:
+    app: kepler-engine
+data:
+  KEPLER_ENV: "production"
+  KEPLER_LOG_LEVEL: "INFO"
+  KEPLER_DATA_SOURCE: "s3"
+  KEPLER_S3_BUCKET: "kepler-koi-data"
+  KEPLER_S3_KEY: "cumulative.csv"
+  KEPLER_MLFLOW_EXPERIMENT_NAME: "kepler-koi"
+  KEPLER_REGISTERED_MODEL_NAME: "kepler-koi-classifier"
+  KEPLER_MODEL_ALIAS: "champion"
+  KEPLER_MODEL_CACHE_TTL_SECONDS: "60"
+  KEPLER_PROMOTE_METRIC: "f1"
+  KEPLER_PROMOTE_THRESHOLD: "0.70"
+  KEPLER_DEFAULT_TEST_SIZE: "0.2"
+  KEPLER_DEFAULT_CV_FOLDS: "5"
+  AWS_REGION: "us-east-1"
