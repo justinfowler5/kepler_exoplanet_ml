@@ -8,8 +8,6 @@ from typing import Any
 
 import mlflow
 import mlflow.sklearn
-import numpy as np
-import pandas as pd
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
 
@@ -91,7 +89,10 @@ class ExperimentTrainer:
 
         mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
         mlflow.set_experiment(settings.mlflow_experiment_name)
-        mlflow.sklearn.autolog(log_models=False, silent=True)
+        # No sklearn autolog: it patches every fit, so each cross_val_score fold uploaded
+        # its own training_confusion_matrix.png and re-logged the whole pipeline repr as
+        # params. This block already logs the params, metrics, plots and model we want,
+        # and the per-fold uploads turned one failing artifact PUT into a retry storm.
 
         with mlflow.start_run() as run:
             run_id = run.info.run_id
@@ -129,14 +130,10 @@ class ExperimentTrainer:
             average = "binary" if len(class_names) == 2 else "macro"
             proba_for_metrics = y_proba
             if y_proba is not None and len(class_names) == 2 and getattr(y_proba, "ndim", 1) == 2:
-                # LabelDecodingClassifier / LabelEncoder order matches sorted class_names
-                pos_idx = class_names.index(pos_label)
-                # But predict_proba columns follow encoder.classes_ order (= sorted)
-                encoder_classes = list(
-                    pipeline.named_steps["model"].encoder_.classes_
-                )
-                pos_idx = encoder_classes.index(pos_label)
-                proba_for_metrics = y_proba[:, pos_idx]
+                # predict_proba columns follow the fitted LabelEncoder's class order,
+                # which is the only reliable source for the positive column index.
+                encoder_classes = [str(c) for c in pipeline.named_steps["model"].encoder_.classes_]
+                proba_for_metrics = y_proba[:, encoder_classes.index(pos_label)]
             metrics = compute_metrics(
                 y_test,
                 y_pred,
@@ -178,7 +175,6 @@ class ExperimentTrainer:
                 name="model",
                 serialization_format="cloudpickle",
                 input_example=X_train.head(3),
-                registered_model_name=None,
             )
 
             # Persist label encoder classes as a tag for inference decoding.

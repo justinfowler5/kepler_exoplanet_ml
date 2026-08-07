@@ -56,24 +56,45 @@ TRANSIT_FIT_COLUMNS: list[str] = [
 ]
 
 
+_ALLOWLIST_LEAK_OVERLAP = sorted(set(FEATURE_COLUMNS) & LEAKAGE_COLUMNS)
+if _ALLOWLIST_LEAK_OVERLAP:
+    raise LeakageViolationError(
+        f"FEATURE_COLUMNS declares leakage columns as features: {_ALLOWLIST_LEAK_OVERLAP}"
+    )
+
+
+def _normalize(name: object) -> str:
+    return str(name).strip().lower()
+
+
 def assert_no_leakage(df: pd.DataFrame) -> None:
     """Raise if *df* contains any known leakage column among its feature set.
 
     The target column itself is allowed to be present (labels need it); every
-    other denylisted column is forbidden.
+    other denylisted column is forbidden. Matching ignores case and surrounding
+    whitespace because NASA TAP exports do not guarantee header casing.
     """
-    present = set(df.columns) & LEAKAGE_COLUMNS
+    present = sorted(c for c in df.columns if _normalize(c) in LEAKAGE_COLUMNS)
     if present:
         raise LeakageViolationError(
-            f"Training frame contains leakage columns: {sorted(present)}. "
+            f"Training frame contains leakage columns: {present}. "
             "These restate the Robovetter decision and must not be used as features."
         )
 
 
 def select_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    """Return the allowlisted feature columns in canonical order."""
+    """Return the allowlisted feature columns in canonical order, as float64.
+
+    Every allowlisted feature is a physical measurement, so the matrix is
+    numeric by definition. Forcing float64 also keeps the logged MLflow
+    signature free of integer columns, which would otherwise reject nulls at
+    inference time for sparsely populated fields like ``koi_tce_plnt_num``.
+    """
     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing:
         raise LeakageViolationError(f"Required feature columns missing: {missing}")
-    assert_no_leakage(df[FEATURE_COLUMNS])
-    return df[FEATURE_COLUMNS].copy()
+    selected = df[FEATURE_COLUMNS].copy()
+    assert_no_leakage(selected)
+    for column in FEATURE_COLUMNS:
+        selected[column] = pd.to_numeric(selected[column], errors="coerce").astype("float64")
+    return selected

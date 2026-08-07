@@ -64,7 +64,6 @@ def app_client(fake_redis, tmp_mlflow, monkeypatch: pytest.MonkeyPatch):
     from kepler_engine.workers import celery_app as celery_module
 
     get_settings.cache_clear()
-    settings = get_settings()
     celery_module.celery_app.conf.task_always_eager = True
     celery_module.celery_app.conf.task_eager_propagates = True
 

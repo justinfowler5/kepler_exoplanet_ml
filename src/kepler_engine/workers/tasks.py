@@ -6,6 +6,7 @@ from typing import Any
 
 from kepler_engine.core.config import get_settings
 from kepler_engine.core.logging import configure_logging, get_logger
+from kepler_engine.core.mlflow_runtime import configure_mlflow_runtime
 from kepler_engine.services.experiment_service import execute_experiment
 from kepler_engine.services.job_store import JobStore, create_redis_client
 from kepler_engine.workers.celery_app import celery_app
@@ -17,6 +18,7 @@ logger = get_logger(__name__)
 def run_experiment_task(self, run_id: str, request: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
     configure_logging(settings.log_level, json_logs=settings.env != "local")
+    configure_mlflow_runtime(settings)
     redis_client = create_redis_client(settings)
     job_store = JobStore(redis_client, ttl_seconds=settings.job_ttl_seconds)
 

@@ -2,7 +2,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${KEPLER_REDIS_HOST_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -16,7 +16,7 @@ services:
       POSTGRES_PASSWORD: mlflow
       POSTGRES_DB: mlflow
     ports:
-      - "5432:5432"
+      - "${KEPLER_POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -32,8 +32,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${KEPLER_MINIO_HOST_PORT:-9000}:9000"
+      - "${KEPLER_MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     volumes:
       - miniodata:/data
     healthcheck:
@@ -68,8 +68,11 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_DEFAULT_REGION: us-east-1
+    # Host port is overridable because 5000 is a common conflict: a local Docker
+    # registry, or AirPlay Receiver on macOS, will already hold it. Only the host
+    # side moves; in-cluster clients keep using mlflow:5000.
     ports:
-      - "5000:5000"
+      - "${KEPLER_MLFLOW_HOST_PORT:-5000}:5000"
     entrypoint: ["/bin/bash", "-c"]
     command:
       - >
@@ -109,7 +112,7 @@ services:
       KEPLER_PROMOTE_METRIC: f1
       KEPLER_PROMOTE_THRESHOLD: "0.50"
     ports:
-      - "8000:8000"
+      - "${KEPLER_API_HOST_PORT:-8000}:8000"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\""]
       interval: 10s

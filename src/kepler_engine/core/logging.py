@@ -41,6 +41,9 @@ def configure_logging(level: str = "INFO", *, json_logs: bool = True) -> None:
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
             renderer,
         ],
+        # Without this, records from stdlib loggers (uvicorn, mlflow, celery, botocore)
+        # render as a bare event with no level, timestamp, or logger name.
+        foreign_pre_chain=shared_processors,
     )
 
     handler = logging.StreamHandler(sys.stdout)

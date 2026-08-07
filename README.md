@@ -6,9 +6,20 @@ A containerized machine learning experiment pipeline that classifies NASA Kepler
 
 ## Project status
 
-Scaffold implemented and locally verified: `uv sync`, `uv run pytest` (25 passed), and `GET /health` against a running uvicorn process. Full Compose end-to-end training (Celery → MLflow UI → `POST /predict`) is the remaining integration check when Docker services are up.
+Implemented and locally verified. What has actually been exercised:
 
-See [Decision record](#decision-record) for the chronology of how we got here.
+- `uv sync --locked` reproduces the environment from the lockfile (130 packages, Python 3.12.13).
+- `uv run pytest` — **57 passed**, including a full train to promoted-champion-to-prediction cycle.
+- `uv run ruff check .` — clean.
+- A real `mlflow server` (3.15.1, Postgres-style sqlite backend plus an artifacts destination) boots and answers `/health` and the experiments REST API.
+- The API boots under uvicorn and serves `GET /health` (200), `GET /health/ready` (503 with per-dependency detail while Redis is down), `GET /api/v1/experiment` (200), `/metrics`, and `/openapi.json` exposing all six planned routes.
+- A training run against a live tracking server registered `kepler-koi-classifier` v1 and set the `champion` alias; `POST /api/v1/predict` then returned `CONFIRMED` at p=0.919 and `FALSE POSITIVE` at p=0.194 for a two-record batch, resolved through `models:/kepler-koi-classifier@champion`.
+- `docker compose config` validates.
+- **The Celery-over-Redis broker hop, driven through `POST /experiment/run`.** A real Redis container, a real `celery worker`, a real tracking server and the API, as four separate processes: the payload returned `202` with a `run_id`, the worker picked the task off the broker, and polling `GET /api/v1/experiment/{run_id}` went `PENDING` to `RUNNING` to `SUCCESS` in about nine seconds, registering v1, setting the `champion` alias, and serving `POST /predict` from it. This closed the gap flagged below and cost two more bugs (findings 11 and 12).
+
+Not yet exercised: the Compose stack as a whole, where Postgres and MinIO substitute for sqlite and local artifacts. See [Verifying it yourself](#verifying-it-yourself).
+
+See [Decision record](#decision-record) for the chronology, including four bugs this verification caught.
 
 ---
 
@@ -109,7 +120,9 @@ sequenceDiagram
 
 ## Inference flow
 
-_Implemented._ `POST /predict` validates the incoming stellar transit metrics against physical bounds, coerces them into a single-row DataFrame with columns in the exact training order, and calls the cached champion Pipeline. The model is loaded lazily on first use and held behind a TTL cache and a thread lock, so a promotion is picked up within the TTL without a restart and without a thundering herd of concurrent loads.
+_Verified end to end against a live tracking server._ `POST /predict` validates the incoming stellar transit metrics against physical bounds, coerces them into a DataFrame with columns in the exact training order, and calls the cached champion Pipeline. The model is loaded lazily on first use and held behind a TTL cache and a thread lock, so a promotion is picked up within the TTL without a restart and without a thundering herd of concurrent loads.
+
+The dtype coercion is load-bearing rather than defensive. Training casts every feature to `float64`, so the logged signature is all doubles, but pandas infers `int64` for integral JSON fields such as `koi_tce_plnt_num` — and MLflow rejects that widening instead of performing it. Without the explicit cast, a perfectly valid request fails signature enforcement. `tests/test_trainer.py::test_promoted_champion_is_servable` pins this contract.
 
 ---
 
@@ -309,7 +322,76 @@ Services once healthy:
 | MLflow UI | http://localhost:5000 | experiment history, model registry |
 | MinIO console | http://localhost:9001 | artifact bucket browser |
 
+**If a port is already taken**, every host-side mapping is overridable, so you do not have to edit `docker-compose.yml`. Port 5000 collides especially often — a local Docker registry will hold it, as will AirPlay Receiver on macOS:
+
+```powershell
+$env:KEPLER_MLFLOW_HOST_PORT = "5001"
+docker compose up --build
+```
+
+Only the host side moves; containers keep talking to each other on `mlflow:5000`, `redis:6379`, and so on, so no application configuration changes. The full set is `KEPLER_API_HOST_PORT`, `KEPLER_MLFLOW_HOST_PORT`, `KEPLER_REDIS_HOST_PORT`, `KEPLER_POSTGRES_HOST_PORT`, `KEPLER_MINIO_HOST_PORT`, and `KEPLER_MINIO_CONSOLE_HOST_PORT`. Check what is holding a port with `docker ps` or `Get-NetTCPConnection -LocalPort 5000 -State Listen`.
+
 ### 3. Drive a training run end to end
+
+#### The `POST /experiment/run` payload
+
+Every field is optional — `{}` is a valid request and trains a random forest with the configured defaults. The body is `ExperimentRunRequest` in `src/kepler_engine/schemas/experiment.py`.
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model_type` | enum | `random_forest` | `logistic_regression`, `random_forest`, `gradient_boosting`, `xgboost` |
+| `hyperparams` | object | `null` | Merged over the model's defaults; only the keys you pass are overridden |
+| `test_size` | float | `0.2` | Must satisfy `0 < test_size < 0.5` |
+| `cv_folds` | int | `5` | `2`–`10`; stratified. Set to `1` or below to skip cross-validation |
+| `label_strategy` | enum | `binary` | `binary`, `not_false_positive`, `multiclass` |
+| `promote` | bool | `true` | Registers a version regardless; the `champion` alias moves only if the metric clears `KEPLER_PROMOTE_THRESHOLD` |
+| `data_source` | string | `null` | Overrides `KEPLER_DATA_SOURCE` for this run: `s3`, `local_csv`, `nasa_archive` |
+
+A full request, and the `202` it returns:
+
+```json
+{
+  "model_type": "xgboost",
+  "hyperparams": { "n_estimators": 150, "max_depth": 4, "learning_rate": 0.1 },
+  "test_size": 0.3,
+  "cv_folds": 3,
+  "label_strategy": "binary",
+  "promote": true,
+  "data_source": "local_csv"
+}
+```
+
+```json
+{ "run_id": "52604a3b-ea6d-4cc2-ad2e-5f3366f7b90a", "status": "PENDING", "message": "Experiment enqueued" }
+```
+
+That `run_id` is the **job** id from Redis, not the MLflow run id; the latter appears as `mlflow_run_id` once the worker opens the run. Poll `GET /api/v1/experiment/{run_id}` until `status` is `SUCCESS` or `FAILURE`:
+
+```json
+{
+  "run_id": "52604a3b-ea6d-4cc2-ad2e-5f3366f7b90a",
+  "status": "SUCCESS",
+  "progress": 1.0,
+  "metrics": { "accuracy": 1.0, "precision": 1.0, "recall": 1.0, "f1": 1.0, "roc_auc": 1.0, "pr_auc": 1.0 },
+  "model_version": "1",
+  "mlflow_run_id": "668be85f583c4db39bbf8d6c6c4899a6",
+  "promoted": true
+}
+```
+
+Those 1.0s are the 30-row fixture being trivially separable, not a good model. The `cv_f1_macro_mean` visible in `GET /api/v1/experiment` is more honest at 0.83 ± 0.14.
+
+A couple of minimal variants:
+
+```json
+{}
+```
+
+```json
+{ "model_type": "logistic_regression", "label_strategy": "multiclass", "cv_folds": 5, "promote": false }
+```
+
+#### Driving it from PowerShell
 
 Using `Invoke-RestMethod`, which handles JSON natively and avoids `curl.exe`'s quote-escaping problems under PowerShell:
 
@@ -317,9 +399,17 @@ Using `Invoke-RestMethod`, which handles JSON natively and avoids `curl.exe`'s q
 $base = "http://localhost:8000/api/v1"
 
 # Kick off training; returns immediately with a run_id
+$body = @{
+    model_type  = "xgboost"
+    test_size   = 0.3
+    cv_folds    = 3
+    promote     = $true
+    data_source = "local_csv"
+    hyperparams = @{ n_estimators = 150; max_depth = 4; learning_rate = 0.1 }
+} | ConvertTo-Json   # nested hyperparams need no -Depth here; add -Depth 5 if you nest further
+
 $job = Invoke-RestMethod -Method Post -Uri "$base/experiment/run" `
-  -ContentType "application/json" `
-  -Body (@{ model_type = "xgboost"; test_size = 0.2; cv_folds = 5 } | ConvertTo-Json)
+  -ContentType "application/json" -Body $body
 
 # Poll until SUCCESS or FAILURE
 do {
@@ -361,7 +451,72 @@ uv run pytest
 uv run ruff check .
 ```
 
-Tests run fully offline: S3 is mocked with `moto`, MLflow writes to a temporary file store, Redis is faked, and Celery runs in eager mode.
+Tests run fully offline: S3 is mocked with `moto`, MLflow writes to a temporary sqlite store, Redis is faked, and Celery runs in eager mode.
+
+### Verifying it yourself
+
+Reproducing the checks in [Project status](#project-status) without Docker takes two terminals and proves the training-to-serving contract end to end. Ports here avoid the common collisions.
+
+```powershell
+# Terminal 1 — a real tracking server on a scratch store
+mkdir .verify -Force
+$root = $PWD.Path -replace '\\','/'
+uv run mlflow server --host 127.0.0.1 --port 5055 `
+  --backend-store-uri "sqlite:///$root/.verify/mlflow.db" `
+  --artifacts-destination "file:///$root/.verify/artifacts"
+```
+
+The `file:///` prefix on `--artifacts-destination` is not optional on Windows. Without it MLflow reads the drive letter `C:` as a URI scheme and returns 500 on every artifact upload — see finding 12. Confirm the path is usable before training anything:
+
+```powershell
+"probe" | Out-File -Encoding ascii .verify\probe.txt
+curl.exe -s -o NUL -w "%{http_code}`n" -X PUT --data-binary "@.verify/probe.txt" `
+  "http://127.0.0.1:5055/api/2.0/mlflow-artifacts/artifacts/probe.txt"   # expect 200, not 500
+```
+
+```powershell
+# Terminal 2 — train, promote, then serve the champion
+$env:MLFLOW_TRACKING_URI = "http://127.0.0.1:5055"
+$env:KEPLER_PROMOTE_THRESHOLD = "0.50"
+
+uv run python -c "from kepler_engine.ml.trainer import ExperimentTrainer; print(ExperimentTrainer().run(model_type='random_forest', test_size=0.3, cv_folds=3))"
+
+uv run uvicorn kepler_engine.main:app --host 127.0.0.1 --port 8077
+```
+
+Then probe it. Note that `/health` stays 200 even with Redis down, while `/health/ready` reports 503 and names the failing dependency:
+
+```powershell
+curl.exe -s http://127.0.0.1:8077/health
+curl.exe -s http://127.0.0.1:8077/health/ready
+```
+
+Do not point this at a tracking server you care about: it registers a model version and moves the `champion` alias. Delete `.verify/` when finished. If the directory refuses to delete, a `mlflow server` process still holds the sqlite file — stop it first.
+
+#### Including the broker hop, without Compose
+
+The above trains in-process, which skips the queue entirely. To exercise what finding 12 uncovered you need Redis and a worker as well, so add two more terminals. Redis alone is enough of a container to be worth it:
+
+```powershell
+docker run -d --name kepler-redis -p 6379:6379 redis:7-alpine
+
+# Terminal 3 — the worker. --pool=solo is required on Windows.
+$env:MLFLOW_TRACKING_URI = "http://127.0.0.1:5055"
+$env:KEPLER_REDIS_URL = "redis://127.0.0.1:6379/0"
+$env:KEPLER_DATA_SOURCE = "local_csv"
+$env:PYTHONUNBUFFERED = "1"   # otherwise structlog's stdout stays buffered and the log looks silent
+uv run celery -A kepler_engine.workers.celery_app worker --loglevel=info --pool=solo
+```
+
+With the same environment exported in the API's terminal, `POST /api/v1/experiment/run` now travels the real path: API to Redis to worker to tracking server. On the 30-row fixture it should reach `SUCCESS` in under fifteen seconds. If it instead sits at `progress: 0.1` for minutes with an empty error field, dump the worker's stack rather than guessing — this is exactly how finding 12 was diagnosed, and it takes one command:
+
+```powershell
+uvx py-spy dump --pid <worker-pid>
+```
+
+Clean up with `docker rm -f kepler-redis`.
+
+Two caveats when running the server directly rather than through Compose. `mlflow server` binds to localhost only and its host/CORS middleware will reject other origins, so add `--allowed-hosts` if you need remote access — and in PowerShell, pass `--allowed-hosts=<value>` rather than a bare `*`, which the shell expands into filenames. Second, `--artifacts-destination` is what enables artifact proxying; `--default-artifact-root` does not.
 
 ---
 
@@ -504,11 +659,30 @@ The chronology of how this design was reached, including the findings that chang
 
 **9. Final resolver check — one pin is not the latest.** Reading MLflow 3.15.1's `requires_dist` revealed a `pandas<3` cap, so pandas is held at 2.3.3 (verified as the highest 2.x release) despite 3.0.5 being available and 3.12-compatible. Without this check, `uv sync` would have failed to resolve or silently downgraded pandas.
 
+**10. Running against a live tracking server — caught a bug the test suite structurally could not.** `KEPLER_MLFLOW_HTTP_BACKOFF_FACTOR` defaulted to `0.2`, which the lifespan exports as `MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR`. MLflow parses that variable with `int()` — unlike the adjacent `MLFLOW_HTTP_REQUEST_BACKOFF_JITTER`, which is a float — so **every** REST call raised `ValueError: invalid literal for int() with base 10: '0.2'` before a request was sent. `GET /api/v1/experiment` returned 500.
+
+The reason the suite missed it is worth internalizing: every test points `MLFLOW_TRACKING_URI` at sqlite, which uses MLflow's direct store and never constructs an HTTP request, so the offending code path is unreachable under test no matter how thorough the coverage. Any bug living in the gap between "direct store" and "REST store" is invisible to a sqlite-backed suite. The setting is now an `int` defaulting to `0` (retry without sleeping, which is what the bounded probe path wanted anyway), and `tests/test_health.py` asserts that every value we export survives MLflow's own parser — a guard confirmed to fail on the old value rather than passing vacuously.
+
+**11. Port 5000 was already occupied.** A `registry:2` container had held host port 5000 for six days, which is exactly where Compose mapped the MLflow UI, so `docker compose up` would have failed on a bind conflict independent of anything in the application. Rather than displace a long-running container, every host-side port mapping is now overridable via `KEPLER_*_HOST_PORT` with the previous values as defaults. Container-to-container addressing is untouched. Port 5000 is a poor default in general — macOS AirPlay Receiver claims it too.
+
+**12. Driving the real broker hop — caught two more bugs, one of them the same shape as finding 10.** Running the four processes for real (Redis container, `celery worker`, tracking server, API) got the task across the broker on the first attempt, but the job then sat in `RUNNING` for over six minutes with no error, no progress past `0.1`, and nothing in the worker log. A `py-spy dump` against the worker gave the answer immediately: the main thread was parked in `urllib3`'s `_sleep_backoff`, six `urlopen` frames deep, underneath `cross_val_score` → MLflow's autolog `patched_fit` → `log_artifacts`. The tracking server was returning 500 on every `PUT /api/2.0/mlflow-artifacts/.../training_confusion_matrix.png`.
+
+Three separate things were wrong, and the interesting part is how they compounded:
+
+- *The 500 was a Windows URI bug in how the local server was launched.* Passing `--artifacts-destination C:/Users/Justi/lab/.local-stack/artifacts` makes MLflow read the drive letter `C:` as a **URI scheme**, and it answers `Could not find a registered artifact repository for: C:/...`. A bare Windows path must be written as a `file:///C:/...` URI. Compose is unaffected because it uses an `s3://` destination.
+- *`mlflow.sklearn.autolog()` amplified one failure into many.* Autolog patches **every** `fit`, so each `cross_val_score` fold independently uploaded its own `training_confusion_matrix.png` and re-logged the entire fitted-pipeline `repr` as run params. The trainer already logs its params, metrics, confusion matrix, permutation importances and model deliberately, so autolog was contributing nothing but duplicates, noise, and three extra chances to hit the failing endpoint. It is now removed, which also made the run's param list legible — 13 intentional params instead of a multi-kilobyte pipeline dump.
+- *The worker never bounded its MLflow retries — the real production hazard.* `configure_mlflow_runtime` exists precisely to cap MLflow's default 7-retry exponential ladder, and its docstring warns that the default "blocks for minutes." But it was only ever called from the FastAPI lifespan; the Celery task called `configure_logging` and nothing else. So the worker ran on MLflow's defaults and each failing upload burned roughly four minutes of `2, 4, 8, 16, 32, 64, 128`-second sleeps while holding a worker slot, reporting nothing. This is the same class of mistake as finding 10 — a setting verified in one process and assumed everywhere — and it is worse in production than locally: a transient S3 hiccup in EKS would silently pin workers instead of failing the job fast. The helper moved to `core/mlflow_runtime.py` so a worker need not import FastAPI to get it, both entrypoints now call it, and `tests/test_health.py` asserts the task itself sets the bounds.
+
+After the fixes the same payload completed in about nine seconds. The lesson mirrors finding 10 almost exactly: eager-mode tests execute the task *function*, but never the task *process*, so anything that depends on worker-process startup — env tuning, signal handling, connection setup — is invisible to them.
+
 ### Still open
 
 - Whether to add `koi_num_transits`, `koi_count`, `koi_max_mult_ev`, `koi_ror`, and `koi_srho` to the feature set as a second experiment. They are legitimate physical measurements and likely to help, but the baseline stays deliberately narrow.
 - Whether promotion should be fully automatic on threshold, or gated behind a manual `POST /experiment/{run_id}/promote` call. The scaffold implements threshold-gated automatic promotion with a configurable metric and floor.
 - Dataset snapshot pinning. NASA re-runs the cumulative table as candidates get confirmed, so row counts drift. Downloaded files should carry a date in the filename for reproducibility.
+- Automating the broker-hop check in CI. Finding 12 was found by hand; a Compose-based smoke test that submits a payload and asserts the job reaches `SUCCESS` within a timeout would catch a regression of it. The new unit test guards the retry bounding specifically, not the whole round trip.
+- A ceiling on total artifact-logging time per run. Bounded retries fix the four-minute-per-call case, but a run that logs many artifacts against a degraded store can still take far longer than its useful lifetime. Celery's `task_time_limit` is the backstop today.
+- Metrics on the committed 30-row fixture are all 1.0, which reflects a trivially separable sample rather than model quality. Judge accuracy only against the full 9,564-row table downloaded via `scripts/download_koi_dataset.py`.
 
 ---
 

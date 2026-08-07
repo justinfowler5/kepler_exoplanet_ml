@@ -79,7 +79,13 @@ class InferenceService:
         missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required feature columns: {missing}")
-        return df[FEATURE_COLUMNS]
+        frame = df[FEATURE_COLUMNS].copy()
+        # Training casts every feature to float64, so the logged signature is all
+        # doubles. Pandas infers int64 for integral fields such as koi_tce_plnt_num,
+        # and MLflow rejects that widening rather than performing it.
+        for column in FEATURE_COLUMNS:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
+        return frame
 
     def _unwrap_sklearn(self, model: Any) -> Any | None:
         unwrapped = getattr(model, "_model_impl", None)
