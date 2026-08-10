@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8000, ge=1, le=65_535)
 
+    # Worker Prometheus scrape endpoint (0 disables the side server)
+    worker_metrics_port: int = Field(default=9100, ge=0, le=65_535)
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _normalize_log_level(cls, value: object) -> object:

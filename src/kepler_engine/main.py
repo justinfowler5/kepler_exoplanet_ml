@@ -9,6 +9,7 @@ from kepler_engine.api.errors import register_exception_handlers
 from kepler_engine.api.v1.health import router as health_router
 from kepler_engine.api.v1.router import api_router
 from kepler_engine.core.config import get_settings
+from kepler_engine.core.http_metrics import Http5xxMetricsMiddleware
 from kepler_engine.core.lifespan import lifespan
 from kepler_engine.core.logging import configure_logging
 
@@ -26,10 +27,14 @@ def create_app() -> FastAPI:
     )
 
     register_exception_handlers(app)
+    app.add_middleware(Http5xxMetricsMiddleware)
     app.include_router(health_router)
     app.include_router(api_router)
 
-    Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+    Instrumentator(
+        should_group_status_codes=False,
+        excluded_handlers=["/metrics", "/health", "/health/ready"],
+    ).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
     return app
 

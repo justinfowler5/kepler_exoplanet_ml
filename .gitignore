@@ -19,12 +19,16 @@ ENV/
 .pytest_cache/
 .mypy_cache/
 .coverage
+coverage.xml
 htmlcov/
+.scannerwork/
+.sonar/
 
 # Environment and secrets
 .env
 .env.local
 *.pem
+.sonar/
 
 # ML artifacts and data
 mlruns/
@@ -43,3 +47,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local scan reports (Trivy, etc.)
+reports/

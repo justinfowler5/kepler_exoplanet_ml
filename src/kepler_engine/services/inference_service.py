@@ -13,6 +13,7 @@ import pandas as pd
 from kepler_engine.core.config import Settings, get_settings
 from kepler_engine.core.exceptions import ModelNotFoundError
 from kepler_engine.core.logging import get_logger
+from kepler_engine.core.metrics import observe_inference, track_model_operation
 from kepler_engine.ml.features import FEATURE_COLUMNS
 from kepler_engine.services.mlflow_client import MLflowService
 
@@ -96,45 +97,56 @@ class InferenceService:
         )
 
     def predict(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        model = self.get_model()
-        X = self.records_to_dataframe(records)
-        raw_preds = model.predict(X)
+        op: dict[str, Any] = {}
+        try:
+            with track_model_operation("inference") as op:
+                model = self.get_model()
+                X = self.records_to_dataframe(records)
+                raw_preds = model.predict(X)
 
-        probabilities: list[float | None] = [None] * len(records)
-        predictor = self._unwrap_sklearn(model)
-        class_names: list[str] | None = None
-        if predictor is not None:
-            est = predictor.named_steps.get("model", predictor) if hasattr(
-                predictor, "named_steps"
-            ) else predictor
-            encoder = getattr(est, "encoder_", None)
-            if encoder is not None:
-                class_names = [str(c) for c in encoder.classes_]
-            if hasattr(predictor, "predict_proba"):
-                try:
-                    proba = predictor.predict_proba(X)
-                    if getattr(proba, "ndim", 1) == 2 and proba.shape[1] >= 2:
-                        conf_idx = 0
-                        if class_names and "CONFIRMED" in class_names:
-                            conf_idx = class_names.index("CONFIRMED")
-                        probabilities = [float(p) for p in proba[:, conf_idx]]
-                    else:
-                        probabilities = [float(p) for p in proba]
-                except Exception:  # noqa: BLE001
-                    pass
+                probabilities: list[float | None] = [None] * len(records)
+                predictor = self._unwrap_sklearn(model)
+                class_names: list[str] | None = None
+                if predictor is not None:
+                    est = (
+                        predictor.named_steps.get("model", predictor)
+                        if hasattr(predictor, "named_steps")
+                        else predictor
+                    )
+                    encoder = getattr(est, "encoder_", None)
+                    if encoder is not None:
+                        class_names = [str(c) for c in encoder.classes_]
+                    if hasattr(predictor, "predict_proba"):
+                        try:
+                            proba = predictor.predict_proba(X)
+                            if getattr(proba, "ndim", 1) == 2 and proba.shape[1] >= 2:
+                                conf_idx = 0
+                                if class_names and "CONFIRMED" in class_names:
+                                    conf_idx = class_names.index("CONFIRMED")
+                                probabilities = [float(p) for p in proba[:, conf_idx]]
+                            else:
+                                probabilities = [float(p) for p in proba]
+                        except Exception:  # noqa: BLE001
+                            pass
 
-        results: list[dict[str, Any]] = []
-        for i, pred in enumerate(raw_preds):
-            label = str(pred)
-            results.append(
-                {
-                    "label": label,
-                    "probability": probabilities[i],
-                    "model_version": self._model_version,
-                    "run_id": None,
-                }
-            )
-        return results
+                results: list[dict[str, Any]] = []
+                for i, pred in enumerate(raw_preds):
+                    label = str(pred)
+                    results.append(
+                        {
+                            "label": label,
+                            "probability": probabilities[i],
+                            "model_version": self._model_version,
+                            "run_id": None,
+                        }
+                    )
+                return results
+        finally:
+            if op:
+                observe_inference(
+                    str(op.get("status", "error")),
+                    float(op.get("duration_seconds", 0.0)),
+                )
 
     def is_loadable(self) -> bool:
         try:

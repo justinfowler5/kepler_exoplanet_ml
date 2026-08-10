@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("setup", "run", "worker", "test", "lint", "up", "down", "download")]
+    [ValidateSet("setup", "run", "worker", "test", "lint", "up", "down", "download", "sonar", "trivy", "sbom")]
     [string]$Task = "setup"
 )
 
@@ -35,5 +35,14 @@ switch ($Task) {
     }
     "download" {
         uv run python scripts/download_koi_dataset.py
+    }
+    "sonar" {
+        & "$PSScriptRoot\scripts\sonar.ps1" all
+    }
+    "trivy" {
+        & "$PSScriptRoot\scripts\trivy.ps1" image
+    }
+    "sbom" {
+        & "$PSScriptRoot\scripts\sbom.ps1" all
     }
 }

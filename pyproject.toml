@@ -21,6 +21,7 @@ dependencies = [
     "joblib==1.5.3",
     "structlog==26.1.0",
     "prometheus-fastapi-instrumentator==8.1.0",
+    "psutil>=7.0.0",
     "httpx==0.28.1",
     "matplotlib>=3.10.0",
     "cloudpickle>=3.1.0",
@@ -30,6 +31,7 @@ dependencies = [
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio>=0.25.0",
+    "pytest-cov>=6.0.0",
     "httpx==0.28.1",
     "moto[s3]==5.2.2",
     "ruff>=0.11.0",
@@ -61,3 +63,15 @@ asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["kepler_engine"]
+relative_files = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+
+[tool.coverage.xml]
+output = "coverage.xml"
