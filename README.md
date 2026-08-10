@@ -16,7 +16,7 @@ Implemented and locally verified. What has actually been exercised:
 - A training run against a live tracking server registered `kepler-koi-classifier` v1 and set the `champion` alias; `POST /api/v1/predict` then returned `CONFIRMED` at p=0.919 and `FALSE POSITIVE` at p=0.194 for a two-record batch, resolved through `models:/kepler-koi-classifier@champion`.
 - `docker compose config` validates.
 - **The Celery-over-Redis broker hop, driven through `POST /experiment/run`.** A real Redis container, a real `celery worker`, a real tracking server and the API, as four separate processes: the payload returned `202` with a `run_id`, the worker picked the task off the broker, and polling `GET /api/v1/experiment/{run_id}` went `PENDING` to `RUNNING` to `SUCCESS` in about nine seconds, registering v1, setting the `champion` alias, and serving `POST /predict` from it. This closed the gap flagged below and cost two more bugs (findings 11 and 12).
-
+- **Prometheus + Grafana in Compose.** The API (`/metrics`) and worker (`:9100/metrics`) are scraped; a training run and a prediction populated `kepler_training_*`, `kepler_inference_*`, and peak CPU/RSS gauges, visible in Prometheus and the provisioned **Kepler Engine** Grafana dashboard.
 Not yet exercised: the Compose stack as a whole, where Postgres and MinIO substitute for sqlite and local artifacts. See [Verifying it yourself](#verifying-it-yourself).
 
 See [Decision record](#decision-record) for the chronology, including four bugs this verification caught.
@@ -25,7 +25,7 @@ See [Decision record](#decision-record) for the chronology, including four bugs 
 
 ## Architecture
 
-Five cooperating tiers. Each is a separate process locally (via Docker Compose) and a separate workload on EKS.
+Six cooperating tiers. Each is a separate process locally (via Docker Compose) and a separate workload on EKS (observability can share the cluster monitoring stack).
 
 ```mermaid
 flowchart LR
@@ -49,6 +49,11 @@ flowchart LR
         MinIO[("MinIO / S3<br/>model artifacts")]
     end
 
+    subgraph obsTier [Observability tier]
+        Prom["Prometheus"]
+        Grafana["Grafana"]
+    end
+
     Source[("S3 bucket or NASA archive<br/>KOI cumulative table")]
 
     Client -->|"POST /experiment/run"| FastAPI
@@ -62,6 +67,9 @@ flowchart LR
     FastAPI -->|"load champion model"| MLflow
     MLflow --> Postgres
     MLflow --> MinIO
+    Prom -->|"scrape /metrics"| FastAPI
+    Prom -->|"scrape :9100/metrics"| Worker
+    Grafana -->|"query"| Prom
 ```
 
 ### What each tool does and why it is here
@@ -75,6 +83,8 @@ flowchart LR
 **scikit-learn + XGBoost — model training.** Preprocessing and the estimator are assembled into a single scikit-learn `Pipeline`, and that whole Pipeline is what gets logged as the model artifact. This is the key defense against train/serve skew: imputation medians and scaler statistics are fitted on training data and travel *with* the model, so `/predict` cannot silently apply different preprocessing than training did. Four estimators are selectable per run (logistic regression, random forest, gradient boosting, XGBoost).
 
 **MLflow — experiment tracking and model registry.** The worker logs hyperparameters, metrics, and artifacts to a standalone MLflow tracking server. Metadata (runs, params, metrics, registry) lives in Postgres; model artifacts live in MinIO locally and S3 on EKS. A run that beats the incumbent is registered as a new model version and gets the `champion` alias. The API resolves `models:/kepler-koi-classifier@champion` at inference time, which means promoting a model requires no redeploy.
+
+**Prometheus + Grafana — runtime observability.** Separate from MLflow's *model-quality* metrics (accuracy, F1, …). Prometheus scrapes the API at `/metrics` and the Celery worker at `:9100/metrics` for request rates, HTTP 5xx, training/inference duration, and peak CPU/RSS during model execution. Grafana ships a provisioned **Kepler Engine** dashboard that charts those series. See [Observability](#observability-prometheus--grafana).
 
 **Docker — containerization.** A single multi-stage image serves both the API and the worker; only the start command differs. This guarantees the two tiers have byte-identical dependency trees, which matters because a Pipeline unpickled by a different scikit-learn version than trained it can fail or, worse, behave subtly differently.
 
@@ -210,8 +220,8 @@ One row violates the documented domain: KOI K00477.01 (`kepid` 10934674) has `ko
 ├── .python-version                 # "3.12", written by `uv python pin`
 ├── .env.example                    # every setting with safe local defaults
 ├── Dockerfile                      # multi-stage uv build; one image for API and worker
-├── docker-compose.yml              # api, worker, redis, mlflow, postgres, minio, minio-init
-├── tasks.ps1                       # PowerShell task runner (setup/run/worker/test/lint/up/down)
+├── docker-compose.yml              # api, worker, redis, mlflow, postgres, minio, prometheus, grafana
+├── tasks.ps1                       # PowerShell task runner (setup/run/worker/test/lint/up/down/…)
 ├── README.md                       # this file
 │
 ├── src/kepler_engine/
@@ -221,6 +231,8 @@ One row violates the documented domain: KOI K00477.01 (`kepid` 10934674) has `ko
 │   │   ├── config.py               # pydantic-settings Settings, KEPLER_ env prefix, cached accessor
 │   │   ├── logging.py              # structlog JSON logs to stdout (CloudWatch-friendly)
 │   │   ├── lifespan.py             # startup/shutdown: Redis pool, MLflow URI, model warmup
+│   │   ├── metrics.py              # Prometheus counters/histograms/gauges for train + infer
+│   │   ├── http_metrics.py         # ASGI middleware counting HTTP 5xx
 │   │   └── exceptions.py           # ModelNotFoundError, DataIngestionError, LeakageViolationError
 │   │
 │   ├── api/
@@ -253,7 +265,7 @@ One row violates the documented domain: KOI K00477.01 (`kepid` 10934674) has `ko
 │   │   └── mlflow_client.py        # register, promote alias, resolve versions, list runs
 │   │
 │   └── workers/
-│       ├── celery_app.py           # Celery config: Redis broker, JSON serializer, time limits
+│       ├── celery_app.py           # Celery config + worker /metrics HTTP server on ready
 │       └── tasks.py                # run_experiment_task with job-status updates
 │
 ├── data/
@@ -264,13 +276,16 @@ One row violates the documented domain: KOI K00477.01 (`kepid` 10934674) has `ko
 │   ├── download_koi_dataset.py     # pull the cumulative table from NASA TAP into data/raw
 │   └── bootstrap_minio.py          # create the artifact bucket for local Compose
 │
-├── deploy/k8s/                     # EKS manifests with probes wired to the health endpoints
-│   ├── configmap.yaml
-│   ├── secret.example.yaml
-│   ├── api-deployment.yaml
-│   ├── api-service.yaml
-│   ├── worker-deployment.yaml
-│   └── hpa.yaml
+├── deploy/
+│   ├── prometheus/prometheus.yml   # scrape configs for api + worker
+│   ├── grafana/                    # datasource + Kepler Engine dashboard provisioning
+│   └── k8s/                        # EKS manifests with probes wired to the health endpoints
+│       ├── configmap.yaml
+│       ├── secret.example.yaml
+│       ├── api-deployment.yaml
+│       ├── api-service.yaml
+│       ├── worker-deployment.yaml
+│       └── hpa.yaml
 │
 └── tests/
     ├── conftest.py                 # TestClient, fake Redis, sample frames, eager Celery
@@ -319,7 +334,11 @@ Services once healthy:
 | --- | --- | --- |
 | API | http://localhost:8000 | control plane |
 | API docs | http://localhost:8000/docs | interactive OpenAPI |
+| API metrics | http://localhost:8000/metrics | Prometheus scrape (HTTP + inference) |
+| Worker metrics | http://localhost:9100/metrics | Prometheus scrape (training) |
 | MLflow UI | http://localhost:5000 | experiment history, model registry |
+| Prometheus | http://localhost:9090 | time-series store / PromQL |
+| Grafana | http://localhost:3000 | dashboards (`admin` / `admin`) |
 | MinIO console | http://localhost:9001 | artifact bucket browser |
 
 **If a port is already taken**, every host-side mapping is overridable, so you do not have to edit `docker-compose.yml`. Port 5000 collides especially often — a local Docker registry will hold it, as will AirPlay Receiver on macOS:
@@ -329,7 +348,7 @@ $env:KEPLER_MLFLOW_HOST_PORT = "5001"
 docker compose up --build
 ```
 
-Only the host side moves; containers keep talking to each other on `mlflow:5000`, `redis:6379`, and so on, so no application configuration changes. The full set is `KEPLER_API_HOST_PORT`, `KEPLER_MLFLOW_HOST_PORT`, `KEPLER_REDIS_HOST_PORT`, `KEPLER_POSTGRES_HOST_PORT`, `KEPLER_MINIO_HOST_PORT`, and `KEPLER_MINIO_CONSOLE_HOST_PORT`. Check what is holding a port with `docker ps` or `Get-NetTCPConnection -LocalPort 5000 -State Listen`.
+Only the host side moves; containers keep talking to each other on `mlflow:5000`, `redis:6379`, and so on, so no application configuration changes. The full set is `KEPLER_API_HOST_PORT`, `KEPLER_MLFLOW_HOST_PORT`, `KEPLER_REDIS_HOST_PORT`, `KEPLER_POSTGRES_HOST_PORT`, `KEPLER_MINIO_HOST_PORT`, `KEPLER_MINIO_CONSOLE_HOST_PORT`, `KEPLER_WORKER_METRICS_HOST_PORT`, `KEPLER_PROMETHEUS_HOST_PORT`, and `KEPLER_GRAFANA_HOST_PORT`. Check what is holding a port with `docker ps` or `Get-NetTCPConnection -LocalPort 5000 -State Listen`.
 
 ### 3. Drive a training run end to end
 
@@ -380,6 +399,11 @@ That `run_id` is the **job** id from Redis, not the MLflow run id; the latter ap
 ```
 
 Those 1.0s are the 30-row fixture being trivially separable, not a good model. The `cv_f1_macro_mean` visible in `GET /api/v1/experiment` is more honest at 0.83 ± 0.14.
+
+After a successful run, two different metric surfaces update:
+
+1. **MLflow / job status** — classification scores and promotion outcome (above, and in the MLflow UI).
+2. **Prometheus** — runtime cost of that training job (`kepler_training_*`, peak CPU/RSS on the worker). Open Grafana at http://localhost:3000 (default `admin` / `admin`) → dashboard **Kepler Engine**, or query Prometheus at http://localhost:9090. Details in [Observability](#observability-prometheus--grafana).
 
 A couple of minimal variants:
 
@@ -532,11 +556,49 @@ _Implemented._ All application routes are versioned under `/api/v1`. Health endp
 | GET | `/api/v1/experiment/{run_id}` | Job status, and metrics once complete. |
 | GET | `/api/v1/experiment` | Recent runs from MLflow. |
 | POST | `/api/v1/predict` | Classify one or many transit-metric records. |
-| GET | `/metrics` | Prometheus scrape endpoint. |
+| GET | `/metrics` | Prometheus scrape endpoint (API process: HTTP + inference metrics). |
 
 ### Why liveness and readiness are separate
 
 Kubernetes treats them differently, and conflating them causes outages. A failing **liveness** probe restarts the pod; a failing **readiness** probe only removes it from the Service's endpoint list. If `/health` checked Redis, then a brief Redis blip would restart every API pod simultaneously — turning a recoverable dependency hiccup into a full outage. So `/health` is deliberately trivial, and only `/health/ready` inspects dependencies.
+
+---
+
+## Observability (Prometheus + Grafana)
+
+Two metric systems answer different questions. Do not conflate them.
+
+| Surface | Question it answers | Where it lives |
+| --- | --- | --- |
+| **MLflow / job status** | Was this model *good*? (accuracy, F1, ROC-AUC, promotion) | MLflow UI; `GET /api/v1/experiment/{run_id}` |
+| **Prometheus / Grafana** | What did the run *cost* at runtime? (duration, CPU, RSS, HTTP errors) | Grafana **Kepler Engine** dashboard; PromQL |
+
+### How runtime metrics are produced
+
+1. **API (`GET /metrics`)** — `prometheus-fastapi-instrumentator` exposes request counts and latencies. Custom middleware increments `kepler_http_5xx_total` on status ≥ 500. `InferenceService.predict` is wrapped so each call records duration plus peak process CPU % and RSS while the model runs.
+2. **Worker (`:9100/metrics`)** — on Celery `worker_ready`, the worker starts a small Prometheus HTTP server (`KEPLER_WORKER_METRICS_PORT`, default `9100`). `execute_experiment` is wrapped the same way for training. The Compose worker uses `--pool=solo` so those counters live in the same process that serves `/metrics` (prefork would hide them in a child).
+3. **Prometheus** scrapes `api:8000/metrics` and `worker:9100/metrics` every 15s (`deploy/prometheus/prometheus.yml`).
+4. **Grafana** is provisioned with a Prometheus datasource and the **Kepler Engine** dashboard (`deploy/grafana/`).
+
+### Series that matter for experiments
+
+| Metric | Meaning |
+| --- | --- |
+| `kepler_training_jobs_total{model_type,status}` | Training jobs completed (success/error) |
+| `kepler_training_duration_seconds_*` | Wall time of each training job |
+| `kepler_inference_requests_total{status}` | Prediction calls |
+| `kepler_inference_duration_seconds_*` | Wall time of each prediction |
+| `kepler_model_op_peak_rss_bytes{operation}` | Peak RSS during `training` or `inference` |
+| `kepler_model_op_cpu_percent{operation}` | Peak CPU % sampled during the op |
+| `kepler_http_5xx_total` | HTTP 5xx responses from the API |
+| `http_requests_total{status}` | Full status breakdown from the instrumentator |
+
+After `docker compose up --build`, open:
+
+- Grafana: http://localhost:3000 (`admin` / `admin`) → **Kepler Engine**
+- Prometheus: http://localhost:9090 → Status → Targets (both `kepler-api` and `kepler-worker` should be UP)
+
+Shorter reference: [`docs/monitoring.md`](docs/monitoring.md).
 
 ---
 
@@ -559,6 +621,7 @@ All settings are read from the environment with the `KEPLER_` prefix via pydanti
 | `KEPLER_MODEL_CACHE_TTL_SECONDS` | how quickly a promotion is picked up |
 | `KEPLER_REDIS_URL` | Celery broker, result backend, and job store |
 | `KEPLER_PROMOTE_METRIC`, `KEPLER_PROMOTE_THRESHOLD` | which metric gates promotion, and its floor |
+| `KEPLER_WORKER_METRICS_PORT` | Prometheus scrape port on the worker (`0` disables the side server) |
 
 MLflow's own S3 client variables (`MLFLOW_S3_ENDPOINT_URL`, `AWS_*`) are set on the MLflow **server** in Compose. They are intentionally *not* set on clients: with proxied artifact storage, an endpoint URL present on both sides makes MLflow concatenate them into an invalid `s3://bucket/key/bucket/key` path.
 
@@ -591,7 +654,8 @@ Everything else runs at its current release:
 | redis | 8.1.0 | broker and job-store client |
 | joblib | 1.5.3 | model serialization |
 | structlog | 26.1.0 | structured JSON logging |
-| prometheus-fastapi-instrumentator | 8.1.0 | metrics endpoint |
+| prometheus-fastapi-instrumentator | 8.1.0 | HTTP metrics endpoint |
+| psutil | ≥7.0 | CPU/RSS sampling during train and infer |
 | pytest / httpx / moto | 9.1.1 / 0.28.1 / 5.2.2 | dev group: tests, API client, S3 mocking |
 
 `requires-python` is set to `>=3.12,<3.13` so uv resolves this set deterministically.
