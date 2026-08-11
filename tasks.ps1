@@ -1,11 +1,13 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("setup", "run", "worker", "test", "lint", "up", "down", "download", "sonar", "trivy", "sbom")]
+    [ValidateSet("setup", "run", "worker", "test", "lint", "build", "up", "down", "download", "sonar", "trivy", "sbom")]
     [string]$Task = "setup"
 )
 
 $ErrorActionPreference = "Stop"
 $env:Path = "C:\Users\Justi\.local\bin;$env:Path"
+$env:DOCKER_BUILDKIT = "1"
+$env:COMPOSE_DOCKER_CLI_BUILD = "1"
 
 switch ($Task) {
     "setup" {
@@ -26,9 +28,13 @@ switch ($Task) {
     "lint" {
         uv run ruff check .
     }
+    "build" {
+        & "$PSScriptRoot\scripts\build.ps1"
+    }
     "up" {
         if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-        docker compose up --build
+        & "$PSScriptRoot\scripts\build.ps1"
+        docker compose up -d --no-build
     }
     "down" {
         docker compose down -v

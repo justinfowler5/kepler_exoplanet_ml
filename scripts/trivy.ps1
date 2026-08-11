@@ -53,11 +53,8 @@ function Build-AppImage {
         Write-Host "Using existing image $ImageTag"
         return
     }
-    Write-Host "Building $ImageTag from Dockerfile ..."
-    docker build -t $ImageTag .
-    if ($LASTEXITCODE -ne 0) {
-        throw "docker build failed with code $LASTEXITCODE"
-    }
+    Write-Host "Building $ImageTag via buildx ..."
+    & (Join-Path $PSScriptRoot "build.ps1") -Tag $ImageTag
 }
 
 function Scan-Image {

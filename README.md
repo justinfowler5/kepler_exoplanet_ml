@@ -220,8 +220,9 @@ One row violates the documented domain: KOI K00477.01 (`kepid` 10934674) has `ko
 ├── .python-version                 # "3.12", written by `uv python pin`
 ├── .env.example                    # every setting with safe local defaults
 ├── Dockerfile                      # multi-stage uv build; one image for API and worker
+├── docker-bake.hcl                 # Buildx bake target -> kepler-engine:local
 ├── docker-compose.yml              # api, worker, redis, mlflow, postgres, minio, prometheus, grafana
-├── tasks.ps1                       # PowerShell task runner (setup/run/worker/test/lint/up/down/…)
+├── tasks.ps1                       # PowerShell task runner (setup/build/run/worker/test/lint/up/down/…)
 ├── README.md                       # this file
 │
 ├── src/kepler_engine/
@@ -273,6 +274,7 @@ One row violates the documented domain: KOI K00477.01 (`kepid` 10934674) has `ko
 │   └── samples/kepler_koi_sample.csv  # committed fixture so tests run offline
 │
 ├── scripts/
+│   ├── build.ps1                   # docker buildx bake wrapper
 │   ├── download_koi_dataset.py     # pull the cumulative table from NASA TAP into data/raw
 │   └── bootstrap_minio.py          # create the artifact bucket for local Compose
 │
@@ -325,8 +327,11 @@ Compose is the intended development path, because training needs Redis, a worker
 
 ```powershell
 copy .env.example .env
-docker compose up --build
+.\tasks.ps1 build          # docker buildx bake -> kepler-engine:local
+docker compose up -d       # or: .\tasks.ps1 up  (build + start)
 ```
+
+Or, equivalently, `docker compose build` (Compose v2 uses Buildx/BuildKit) then `docker compose up -d`.
 
 Services once healthy:
 
@@ -593,7 +598,7 @@ Two metric systems answer different questions. Do not conflate them.
 | `kepler_http_5xx_total` | HTTP 5xx responses from the API |
 | `http_requests_total{status}` | Full status breakdown from the instrumentator |
 
-After `docker compose up --build`, open:
+After `.\tasks.ps1 up` (or `docker compose up -d` with a baked image), open:
 
 - Grafana: http://localhost:3000 (`admin` / `admin`) → **Kepler Engine**
 - Prometheus: http://localhost:9090 → Status → Targets (both `kepler-api` and `kepler-worker` should be UP)
@@ -680,7 +685,15 @@ MLflow 3 changed several APIs that virtually every tutorial still uses in their 
 
 ## Container build
 
-Multi-stage, with dependency installation separated from source copying so that editing application code does not invalidate the dependency layer.
+Images are built with **Docker Buildx** via `docker-bake.hcl`, loaded into the engine as `kepler-engine:local`. The Dockerfile remains multi-stage: dependency installation is separated from source copying so editing application code does not invalidate the dependency layer.
+
+```powershell
+.\tasks.ps1 build
+# same as:
+docker buildx bake -f docker-bake.hcl
+```
+
+Compose `api` and `worker` both use `image: kepler-engine:local` so one bake feeds both services. Trivy/SBOM helpers call the same build path.
 
 **Builder:** `ghcr.io/astral-sh/uv:0.12.1-python3.12-trixie-slim`. _Verified: this tag resolves; the widely cited `bookworm` variants are stale (frozen since February 2026) and the version-pinned bookworm form returns 404 — uv's Debian images are now trixie-based._ The build runs `uv sync --locked --no-dev --no-editable` with a cache mount and bind-mounted lockfile.
 
